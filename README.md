@@ -79,5 +79,18 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 目录同步列版本与数据表同步回执
+
+- `backend/app/sync_ledger.py` 是回执台账：回执必须对应确切表名、目标目录和
+  已验证列版本；重发只保留原凭据、不重复计数，旧凭据不能抵新版欠账，
+  相似表名不算已同步。台账存在 `_sync_receipt` / `_sync_reconcile`
+  私有表，不进模块总览。
+- Schema 变更管理按回执逐目录对账（`reconcile_change`），待同步范围列出各目录
+  尚欠的列版本，历史对账按变更编号查回（`get_reconciliation_history`）。
+- 目录同步按版本启动（`start_version_sync`）：启动前读取上一版对账结果，
+  同一目标目录先确认上一版；重试不多开同步任务。
+- 场景演练：`cd backend && PYTHONPATH=. .venv/bin/python scripts/scenario_order_sync.py`
+  跑通订单表 V1→V3 跨 A/B 两目录的回执、对账、启动全链路核对。
+
 领域：数据工程
 子方向：数仓与数据湖

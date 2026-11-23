@@ -1,11 +1,18 @@
 """Schema变更管理领域服务：管理表Schema的变更申请、兼容性检查和回退执行。
 
-数据链路位置：架构管理层，控制数据表结构变更的范围和影响。"""
+数据链路位置：架构管理层，控制数据表结构变更的范围和影响。
+
+一致性约定：变更是否同步到各目标目录，只按数据表同步回执对账——
+回执必须对应确切表名、目标目录和已验证列版本；对账结果存档，
+供目录同步启动下一版前读取，也可按变更编号查回。
+"""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
+from app import sync_ledger
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -153,10 +160,24 @@ class SchemaChangeService(BaseModuleService):
         }
 
     def reconcile_with_catalog_sync(self, entry_id: int) -> dict[str, Any]:
-        """对账Schema变更与Catalog同步状态。
+        """对账Schema变更与Catalog同步状态（按数据表同步回执精确对账）。
 
-        检查变更后的Schema是否已成功同步到目标Catalog，
-        未同步时生成同步提醒。
+        只认确切表名 + 目标目录 + 已验证列版本的回执；
+        同步范围里的相似表名不算已同步。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "变更记录不存在"}
+        if not str(entry.get("列版本") or "").strip():
+            return {"ok": False, "message": "变更记录缺少列版本，无法按回执对账"}
+        return self.reconcile_change(entry_id)
+
+    def reconcile_change(self, entry_id: int) -> dict[str, Any]:
+        """按列版本逐目录对账：用已验证的数据表同步回执核对本变更。
+
+        逐目录检查本变更列版本是否已有已验证回执，并汇总待同步范围
+        （各目录尚欠回执的列版本）。结果存档，可按变更编号查回；
+        目录同步启动下一版前读取的就是这份对账结果。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -164,20 +185,80 @@ class SchemaChangeService(BaseModuleService):
         if entry.get("status") != "已执行":
             return {"ok": False, "message": "只有已执行的变更才需要对账"}
 
-        sync_rows = store.rows("catalog_sync")
-        target_table = entry.get("目标表", "")
-        related_syncs = [
-            s for s in sync_rows
-            if target_table in s.get("同步范围", "") and s.get("status") == "已同步"
-        ]
+        table = str(entry.get("目标表") or "").strip()
+        version = str(entry.get("列版本") or "").strip().upper()
+        catalogs = self._sync_catalogs(entry)
+        if not table or not version or not catalogs:
+            return {"ok": False, "message": "变更记录缺少目标表、列版本或同步目录，无法按回执对账"}
 
-        return {
-            "change_id": entry_id,
-            "target_table": target_table,
-            "synced_to_catalogs": len(related_syncs),
-            "catalogs_detail": [
-                {"task_name": s.get("任务名称"), "target_catalog": s.get("目标Catalog")}
-                for s in related_syncs
-            ],
-            "all_good": len(related_syncs) > 0,
+        per_catalog: dict[str, Any] = {}
+        for catalog in catalogs:
+            credential = sync_ledger.receipt_credential(table, catalog, version)
+            per_catalog[catalog] = {
+                "状态": "已确认" if credential else "欠回执",
+                "凭据": credential,
+            }
+
+        payload = {
+            "目标表": table,
+            "列版本": version,
+            "目录对账": per_catalog,
+            "待同步范围": self.pending_scope(table, catalogs),
+            "全部确认": all(item["状态"] == "已确认" for item in per_catalog.values()),
+            "对账时间": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        record = sync_ledger.record_reconciliation(entry_id, payload)
+        return {"ok": True, **record}
+
+    def get_reconciliation_history(self, entry_id: int) -> dict[str, Any]:
+        """按变更编号查回历史对账，过去的对账结果不丢。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "变更记录不存在"}
+        history = sync_ledger.reconciliations_for(entry_id)
+        return {
+            "ok": True,
+            "change_id": entry_id,
+            "count": len(history),
+            "history": history,
+        }
+
+    def pending_scope(self, table: str, catalogs: list[str] | None = None) -> dict[str, list[str]]:
+        """待同步范围：各目录尚欠数据表同步回执的列版本列表。
+
+        欠账口径 = 已执行变更的列版本中，该目录还没有已验证回执的部分；
+        旧版本回执只抵旧版本，相似表名的回执不算数。
+        """
+        executed_versions = sorted(
+            {str(c.get("列版本")).strip().upper() for c in store.rows(self.MODULE)
+             if c.get("目标表") == table and c.get("status") == "已执行"
+             and str(c.get("列版本") or "").strip()},
+            key=sync_ledger.version_seq,
+        )
+        if catalogs is None:
+            catalogs = sorted({
+                catalog
+                for c in store.rows(self.MODULE) if c.get("目标表") == table
+                for catalog in self._sync_catalogs(c)
+            })
+        return {
+            catalog: [
+                version for version in executed_versions
+                if not sync_ledger.is_confirmed(table, catalog, version)
+            ]
+            for catalog in catalogs
+        }
+
+    def find_change_for_version(self, table: str, column_version: str) -> dict[str, Any] | None:
+        """查某表某列版本对应的已执行变更记录，供目录同步启动前对账。"""
+        wanted = str(column_version or "").strip().upper()
+        for change in store.rows(self.MODULE):
+            if (change.get("目标表") == table
+                    and str(change.get("列版本") or "").strip().upper() == wanted
+                    and change.get("status") == "已执行"):
+                return change
+        return None
+
+    @staticmethod
+    def _sync_catalogs(entry: dict[str, Any]) -> list[str]:
+        return [c.strip() for c in str(entry.get("同步目录") or "").split(",") if c.strip()]
